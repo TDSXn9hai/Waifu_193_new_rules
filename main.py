@@ -73,8 +73,11 @@ class WaifuCache:
         self.bracket_rate = []
         self.group_response_delay = 3
         self.person_response_delay = 0
+        self.personate_delay = 0
         self.group_message_chain = None
         self.blacklist = []
+        self.ignore_prefix = []
+        self.response_regexp = []
 
 
 @runner.runner_class("waifu-mode")
@@ -88,9 +91,8 @@ class WaifuRunner(runner.RequestRunner):
         return
 
 
-@register(name="Waifu", description="Cuter than real waifu!", version="1.9.3", author="ElvisChenML")
+@register(name="Waifu", description="Cuter than real waifu!", version="1.9.7", author="ElvisChenML")
 class Waifu(BasePlugin):
-
     def __init__(self, host: APIHost):
         self.ap = host.ap
         self._ensure_required_files_exist()
@@ -99,10 +101,13 @@ class Waifu(BasePlugin):
         self._set_permissions_recursively("data/plugins/Waifu/", 0o777)
 
     async def initialize(self):
-        await self._set_waifu_runner()
+        await self._set_runner("waifu-mode")
         # 为新用户创建配置文件
         config_mgr = ConfigManager(f"data/plugins/Waifu/config/waifu", "plugins/Waifu/templates/waifu")
         await config_mgr.load_config(completion=True)
+
+    async def destroy(self):
+        await self._set_runner(self.ap.provider_cfg.data['runner'])
 
     # @handler(NormalMessageResponded)
     # async def normal_message_responded(self, ctx: EventContext):
@@ -114,6 +119,7 @@ class Waifu(BasePlugin):
         :param ctx: 包含事件上下文信息的 EventContext 对象
         :return: True if allowed to continue, False otherwise
         """      
+        bot_account_id = ctx.event.query.adapter.bot_account_id
         text_message = str(ctx.event.query.message_chain)
         launcher_id = ctx.event.launcher_id
         sender_id = ctx.event.sender_id
@@ -139,7 +145,8 @@ class Waifu(BasePlugin):
         if launcher_id not in self.waifu_cache:
             await self._load_config(launcher_id, ctx.event.launcher_type)
         waifu_data = self.waifu_cache.get(launcher_id, None)
-
+        if waifu_data:
+            waifu_data.memory.bot_account_id = bot_account_id
         # 继承LangBot的群消息响应规则时忽略 GroupMessageReceived 信号
         if event_type == "GMR" and waifu_data.langbot_group_rule == True:
             return False
@@ -150,6 +157,10 @@ class Waifu(BasePlugin):
         # 排除主项目命令
         cmd_prefix = self.ap.command_cfg.data.get("command-prefix", [])
         if any(text_message.startswith(prefix) for prefix in cmd_prefix):
+            return False
+        
+        # 排除特定前缀
+        if waifu_data and any(text_message.startswith(prefix) for prefix in waifu_data.ignore_prefix):
             return False
 
         # Waifu 群聊成员黑名单
@@ -209,10 +220,13 @@ class Waifu(BasePlugin):
         cache.bracket_rate = config_mgr.data.get("bracket_rate", [])
         cache.group_response_delay = config_mgr.data.get("group_response_delay", 10)
         cache.person_response_delay = config_mgr.data.get("person_response_delay", 0)
+        cache.personate_delay = config_mgr.data.get("personate_delay", 0)
         cache.continued_rate = config_mgr.data.get("continued_rate", 0.5)
         cache.continued_max_count = config_mgr.data.get("continued_max_count", 2)
         cache.blacklist = config_mgr.data.get("blacklist", [])
         cache.langbot_group_rule = config_mgr.data.get("langbot_group_rule", False)
+        cache.ignore_prefix = config_mgr.data.get("ignore_prefix", [])
+        cache.response_regexp = config_mgr.data.get("response_regexp", [])
 
         await cache.memory.load_config(character, launcher_id, launcher_type)
         await cache.value_game.load_config(character, launcher_id, launcher_type)
@@ -225,17 +239,20 @@ class Waifu(BasePlugin):
 
         self._set_permissions_recursively("data/plugins/Waifu/", 0o777)
 
-    async def _set_waifu_runner(self):
-        """用于设置 RunnerManager 的 using_runner 为 waifu-mode"""
+    async def _set_runner(self, runner_name: str):
+        """用于设置 RunnerManager 的 using_runner"""
         runner_mgr = self.ap.runner_mgr
         if runner_mgr:
             for r in runner.preregistered_runners:
-                if r.name == "waifu-mode":
+                if r.name == runner_name:
                     runner_mgr.using_runner = r(self.ap)
                     await runner_mgr.using_runner.initialize()
+                    self.ap.logger.info(f"已设置运行器为 {runner_name}")
                     break
             else:
-                raise Exception("Runner 'waifu-mode' not found in preregistered_runners.")
+                raise Exception(
+                    f"Runner '{runner_name}' not found in preregistered_runners."
+                )
 
     async def _handle_command(self, ctx: EventContext) -> typing.Tuple[bool, bool]:
         need_assistant_reply = False
@@ -393,9 +410,13 @@ class Waifu(BasePlugin):
         need_assistant_reply = False
         if config.group_message_chain and config.group_message_chain.has(platform_message.At(ctx.event.query.adapter.bot_account_id)):
             need_assistant_reply = True
+        if config.response_regexp:
+            message_text = str(ctx.event.query.message_chain)
+            need_assistant_reply = any(re.search(p, message_text) for p in config.response_regexp)
         if config.unreplied_count >= config.memory.response_min_conversations:
-            if random.random() < config.response_rate:
-                need_assistant_reply = True
+            need_assistant_reply = True
+        if random.random() < config.response_rate:
+            need_assistant_reply = True
         else:
             self.ap.logger.info(f"群聊{launcher_id}还差{config.memory.response_min_conversations - config.unreplied_count}条消息触发回复")
 
@@ -443,7 +464,7 @@ class Waifu(BasePlugin):
             related_memories = await config.memory.load_memory(unreplied_conversations)
             if related_memories:
                 config.cards.set_memory(related_memories)
-
+        # 如果是群聊则不修改为自定义角色名
         system_prompt = config.memory.to_custom_names(config.cards.generate_system_prompt())
         # 备份然后重置避免回复过程中接收到新讯息导致计数错误
         unreplied_count = config.unreplied_count
@@ -590,7 +611,7 @@ class Waifu(BasePlugin):
 
     async def _send_personate_reply(self, ctx: EventContext, response: str):
         config = self.waifu_cache[ctx.event.launcher_id]
-        parts = re.split(r"([，。？！,.?!\n~〜])", response)  # 保留分隔符
+        parts = re.split(r"(?<!\d)[，。？！,.?!\n~〜](?!\d)", response)  # 保留分隔符(避免分割小数)
         combined_parts = []
         temp_part = ""
 
@@ -630,7 +651,10 @@ class Waifu(BasePlugin):
         for part in combined_parts:
             await self._reply(ctx, f"{part}", True)
             self.ap.logger.info(f"发送：{part}")
-            await asyncio.sleep(len(part) / 2)  # 根据字数计算延迟时间，假设每2个字符1秒
+            if config.personate_delay != 0:
+                await asyncio.sleep(config.personate_delay)
+            else:
+                await asyncio.sleep(len(part) / 2)  # 根据字数计算延迟时间，假设每2个字符1秒
 
     async def _vision(self, ctx: EventContext) -> str:
         # 参考自preproc.py PreProcessor
@@ -650,6 +674,9 @@ class Waifu(BasePlugin):
                     if me.url is not None:
                         has_image = True
                         content_list.append(llm_entities.ContentElement.from_image_url(str(me.url)))
+                    elif me.base64 is not None:
+                        has_image = True
+                        content_list.append(llm_entities.ContentElement.from_image_base64(str(me.base64)))
         if not has_image:
             return str(query.message_chain)
         else:

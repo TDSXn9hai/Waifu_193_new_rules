@@ -20,8 +20,8 @@ retrieve_top_n: 3 # 长期记忆，每次提取retrieve_top_n条相关的长期�
 summary_max_tags: 50 # 长期记忆，每段长期记忆的最大标签数量（高频词、类型名称）。
 
 # 群聊设置
-response_min_conversations: 1 # 群聊触发回复的最小对话数量。
-response_rate: 1 # 群聊触达到最小对话数量后回复的机率，为1时所有消息都响应。
+response_min_conversations: 1 # 群聊未回复消息达到该数量时立即触发回复，不再进行概率判定。
+response_rate: 1 # 未达到 response_min_conversations 时，每条消息触发回复的机率；为1时必定触发。
 response_regexp: [] # 群聊消息命中任意一条正则表达式时立即触发回复（不受 response_rate 和 response_min_conversations 限制）。使用 Python 正则语法，匹配消息纯文本；字符串列表形式输入，例如：["关键词1|关键词2", "^你好", "(?i)waifu"]。
 ignore_prefix: [] # 忽略以指定前缀开头的消息（不记录、不回复），字符串列表形式输入，例如：["#", "/"]。
 group_response_delay: 0 # 群聊消息合并等待时间。

@@ -471,20 +471,25 @@ class Waifu(BasePlugin):
         launcher_id = ctx.event.launcher_id
         config = self.waifu_cache[launcher_id]
         need_assistant_reply = False
-        if config.group_message_chain and config.group_message_chain.has(platform_message.At(ctx.event.query.adapter.bot_account_id)):
-            need_assistant_reply = True
-        # 命中自定义正则时必定回复，且不受回复概率与最小对话数限制
-        if check_regexp and self._match_response_regexp(ctx, config):
-            need_assistant_reply = True
 
-        if not need_assistant_reply:
-            if config.unreplied_count >= config.memory.response_min_conversations:
-                if random.random() < config.response_rate:
-                    need_assistant_reply = True
-                else:
-                    self.ap.logger.info(f"群聊{launcher_id}未命中回复概率（response_rate={config.response_rate}）")
+        # 1. 未回复消息数量判定：达到要求立即触发，不再进行概率判定
+        if config.unreplied_count >= config.memory.response_min_conversations:
+            need_assistant_reply = True
+            self.ap.logger.info(f"群聊{launcher_id}未回复消息数达到 {config.unreplied_count}，触发回复")
+        else:
+            # 2. 尚未达到数量要求时，才进行概率判定
+            if random.random() < config.response_rate:
+                need_assistant_reply = True
+                self.ap.logger.info(f"群聊{launcher_id}命中回复概率（response_rate={config.response_rate}）")
             else:
                 self.ap.logger.info(f"群聊{launcher_id}还差{config.memory.response_min_conversations - config.unreplied_count}条消息触发回复")
+
+        # 3. @ 或正则命中必定触发，不受未回复数量和概率影响
+        if config.group_message_chain and config.group_message_chain.has(platform_message.At(ctx.event.query.adapter.bot_account_id)):
+            need_assistant_reply = True
+            self.ap.logger.info(f"群聊{launcher_id}被@，触发回复")
+        if check_regexp and self._match_response_regexp(ctx, config):
+            need_assistant_reply = True
 
         config.group_message_chain = None
         if need_assistant_reply:

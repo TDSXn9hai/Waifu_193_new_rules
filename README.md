@@ -253,8 +253,8 @@
   summary_max_tags: 50 # 长期记忆，每段长期记忆的最大标签数量（高频词、类型名称）。
   
   # 群聊设置
-  response_min_conversations: 1 # 群聊触发回复的最小对话数量。
-  response_rate: 1 # 群聊触达到最小对话数量后回复的机率，为1时所有消息都响应。
+  response_min_conversations: 1 # 群聊未回复消息达到该数量时立即触发回复。
+  response_rate: 1 # 未达到该数量时每条消息触发回复的机率，为1时必定触发。
   response_regexp: [] # 群聊消息命中任意一条正则表达式时立即触发回复，不受 response_rate 和 response_min_conversations 限制。
   ignore_prefix: [] # 忽略以指定前缀开头的消息（不记录、不回复）。
   group_response_delay: 0 # 群聊消息合并等待时间。

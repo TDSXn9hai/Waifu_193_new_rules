@@ -22,6 +22,8 @@ summary_max_tags: 50 # 长期记忆，每段长期记忆的最大标签数量（
 # 群聊设置
 response_min_conversations: 1 # 群聊触发回复的最小对话数量。
 response_rate: 1 # 群聊触达到最小对话数量后回复的机率，为1时所有消息都响应。
+response_regexp: [] # 群聊消息命中任意一条正则表达式时立即触发回复（不受 response_rate 和 response_min_conversations 限制）。使用 Python 正则语法，匹配消息纯文本；字符串列表形式输入，例如：["关键词1|关键词2", "^你好", "(?i)waifu"]。
+ignore_prefix: [] # 忽略以指定前缀开头的消息（不记录、不回复），字符串列表形式输入，例如：["#", "/"]。
 group_response_delay: 0 # 群聊消息合并等待时间。
 blacklist: [] # 屏蔽列表，将自动过滤来自列表中QQ号的消息；以数字列表形式输入：[QQ号, QQ号, QQ号, ...]。
 repeat_trigger: 2 # 0为关闭复读；群聊出现重复发言时触发复读的最小次数（不含原发言）；触发回复后，检测到重复出现的对话时参与复读。
@@ -38,3 +40,24 @@ intervals: [] # 列表，自动触发旁白推进剧情的时间间隔，单位�
 person_response_delay: 0 # 私聊消息合并等待时间。
 continued_rate: 0 # 自动触发回复后继续发言的机率。
 continued_max_count: 2 # 私聊最大延续发言次数。
+
+# 事件系统
+events_enabled: false # 是否启用事件系统：根据状态与行为触发事件，将事件引入上下文，并可主动发起消息。
+event_idle_interval: 0 # 用户最后发言后经过多少秒尝试主动发起事件消息；0 表示关闭主动事件。
+event_idle_rate: 0.5 # 到达 event_idle_interval 后触发主动事件的机率，范围 0~1。
+event_idle_min_messages: 2 # 短期记忆中至少有多少条消息才允许触发主动事件。
+event_max_words: 60 # 生成事件描述的最大字数（提示词约束）。
+event_rules: [] # 消息触发规则列表，支持 name/regexp/min_value/max_value/cooldown/probability/once/prompt，示例见 README。
+
+# 联网搜索
+search_enabled: false # 是否启用联网搜索；搜索结果会作为事实参考注入当前回复的 system prompt。
+search_mode: "auto" # auto：由模型判断是否需要搜索；always：每条消息都搜索；off：关闭。
+search_provider: "duckduckgo" # duckduckgo/searxng/serper/tavily。
+search_api_url: "" # searxng 实例地址；serper/tavily/duckduckgo 可留空使用默认地址。
+search_api_key: "" # serper/tavily 需要填写。
+search_max_results: 5 # 最多注入的搜索结果数量。
+search_max_queries: 2 # 单次决策最多执行的搜索词数量（1~5）。
+search_timeout: 10 # 单次搜索请求超时时间（秒）。
+search_language: "zh-CN" # 搜索语言。
+search_cache_ttl: 600 # 相同搜索词的缓存时间（秒）。
+search_trigger_regexp: [] # 消息命中任意正则时强制搜索（auto 模式下作为补充），例如：["今天天气", "^新闻"]。

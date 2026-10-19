@@ -154,6 +154,10 @@
 
 ✅ 状态栏 value_game.py：给与角色一个状态数值，不同数值可影响角色表现。
 
+✅ 事件 events.py：根据状态及行为触发事件，将事件引入上下文，并可主动发起消息。
+
+✅ 联网搜索 searching.py：根据用户的信息自主构造搜索决策，并将搜索结果引入上下文。
+
 #### 辅助文件 Water
 
 ✅ 配置文件模板 templates：若无配置文件，将由模板生成。
@@ -167,10 +171,6 @@
 ### 待实现功能（画饼）
 
 ⬜ 情绪感知 emotions.py：模拟当前场景情绪，并做出相应反馈。
-
-⬜ 事件 events.py：根据状态及行为触发事件引入上下文并主动发起消息。
-
-⬜ 联网搜索 searching.py：根据用户的信息，自主构造搜索决策，并引入上下文。
 
 ⬜ AI 绘图支持 portrait.py：将绘图引入思考链，使 AI 可以生成图片，例如 AI 自拍。
 
@@ -255,6 +255,8 @@
   # 群聊设置
   response_min_conversations: 1 # 群聊触发回复的最小对话数量。
   response_rate: 1 # 群聊触达到最小对话数量后回复的机率，为1时所有消息都响应。
+  response_regexp: [] # 群聊消息命中任意一条正则表达式时立即触发回复，不受 response_rate 和 response_min_conversations 限制。
+  ignore_prefix: [] # 忽略以指定前缀开头的消息（不记录、不回复）。
   group_response_delay: 0 # 群聊消息合并等待时间。
   blacklist: [] # 屏蔽列表，将自动过滤来自列表中QQ号的消息；以数字列表形式输入：[QQ号, QQ号, QQ号, ...]。
   repeat_trigger: 2 # 0为关闭复读；群聊出现重复发言时触发复读的最小次数（不含原发言）；触发回复后，检测到重复出现的对话时参与复读。
@@ -271,7 +273,67 @@
   person_response_delay: 0 # 私聊消息合并等待时间。
   continued_rate: 0 # 自动触发回复后继续发言的机率。
   continued_max_count: 2 # 私聊最大延续发言次数。
+
+  # 事件系统
+  events_enabled: false # 是否启用事件系统。
+  event_idle_interval: 0 # 用户最后发言后经过多少秒尝试主动发起事件消息；0 表示关闭。
+  event_idle_rate: 0.5 # 触发主动事件的机率。
+  event_idle_min_messages: 2 # 触发主动事件所需的最少短期记忆条数。
+  event_max_words: 60 # 事件描述最大字数。
+  event_rules: [] # 消息触发规则列表，示例见下方。
+
+  # 联网搜索
+  search_enabled: false # 是否启用联网搜索。
+  search_mode: "auto" # auto/always/off。
+  search_provider: "duckduckgo" # duckduckgo/searxng/serper/tavily。
+  search_api_url: "" # searxng 实例地址；其他服务可留空。
+  search_api_key: "" # serper/tavily 需要填写。
+  search_max_results: 5 # 最多注入的搜索结果数量。
+  search_max_queries: 2 # 单次决策最多执行的搜索词数量。
+  search_timeout: 10 # 搜索请求超时时间（秒）。
+  search_language: "zh-CN" # 搜索语言。
+  search_cache_ttl: 600 # 搜索词缓存时间（秒）。
+  search_trigger_regexp: [] # 命中任意正则时强制搜索。
   ```
+
+  * `response_regexp` 使用 Python 正则表达式（`re.search`）匹配群消息的纯文本内容，命中任意一条即立即触发回复，且优先于 `response_rate` 和 `response_min_conversations`。非法正则会跳过并在日志中提示，例如：
+
+    ```yaml
+    response_regexp:
+      - "关键词1|关键词2"
+      - "^/?(waifu|老婆)"
+      - "(?i)hello"
+    ```
+
+    该配置同样可以在 `waifu_[会话].yaml` 中为单个群单独覆盖。
+
+  * 事件系统：`events_enabled: true` 后，会根据 Value Game 状态、当前时间、最近对话和用户最后一条消息判断是否触发事件。事件会以旁白事实写入短期记忆并参与后续回复；`event_idle_interval` 大于 0 时，用户沉默达到该秒数后会尝试生成事件并主动发送消息。消息触发规则示例：
+
+    ```yaml
+    event_rules:
+      - name: "被冷落后的反应"
+        regexp: "不理你|你好烦|走开"
+        min_value: 0
+        max_value: 300
+        cooldown: 3600
+        probability: 0.6
+        once: false
+        prompt: "设计一个角色被冷落后独自做的小事，例如默默收起准备好的零食。"
+    ```
+
+    字段说明：`regexp` 为对用户消息的 Python 正则匹配；`min_value`/`max_value` 对应 Value Game 数值范围；`cooldown` 为同一规则的触发冷却秒数；`once` 为是否只触发一次；`prompt` 为该事件的额外生成要求。省略 `regexp` 时，任意消息都可能触发该规则。
+
+  * 联网搜索：启用后，`search_mode` 为 `auto` 时由模型结合最近对话判断是否需要搜索并自主生成查询词；为 `always` 时每条用户消息都会搜索。搜索结果会作为事实参考追加到当前回复的 system prompt，不会写入短期记忆。`duckduckgo` 无需密钥；`searxng` 需要填写实例地址；`serper`/`tavily` 需要填写 API Key。搜索失败时只记录日志，不影响正常回复。
+
+    ```yaml
+    search_enabled: true
+    search_mode: "auto"
+    search_provider: "searxng"
+    search_api_url: "https://your-searxng.example.com"
+    search_max_results: 5
+    search_trigger_regexp:
+      - "今天天气|最新消息|现在多少钱"
+    ```
   
 * cards/default_*.yaml (person/group)
   

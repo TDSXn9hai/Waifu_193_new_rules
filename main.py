@@ -18,6 +18,8 @@ from plugins.Waifu.cells.cards import Cards
 from plugins.Waifu.organs.memories import Memory
 from plugins.Waifu.systems.narrator import Narrator
 from plugins.Waifu.systems.value_game import ValueGame
+from plugins.Waifu.systems.events import Events
+from plugins.Waifu.systems.searching import Searching
 from plugins.Waifu.organs.thoughts import Thoughts
 
 COMMANDS = {
@@ -54,6 +56,8 @@ class WaifuCache:
         self.cards = Cards(ap)
         self.narrator = Narrator(ap, launcher_id)
         self.thoughts = Thoughts(ap)
+        self.events = Events(ap, launcher_id, launcher_type)
+        self.searching = Searching(ap, launcher_type)
         self.conversation_analysis_flag = True
         self.thinking_mode_flag = True
         self.story_mode_flag = True
@@ -77,7 +81,9 @@ class WaifuCache:
         self.group_message_chain = None
         self.blacklist = []
         self.ignore_prefix = []
+        # 已编译的正则表达式列表，由 response_regexp 配置项编译而来
         self.response_regexp = []
+        self.event_timer_task = None
 
 
 @runner.runner_class("waifu-mode")
@@ -120,7 +126,7 @@ class Waifu(BasePlugin):
         :return: True if allowed to continue, False otherwise
         """      
         bot_account_id = ctx.event.query.adapter.bot_account_id
-        text_message = str(ctx.event.query.message_chain)
+        text_message = self._get_message_text(ctx)
         launcher_id = ctx.event.launcher_id
         sender_id = ctx.event.sender_id
         launcher_type = ctx.event.launcher_type
@@ -179,6 +185,7 @@ class Waifu(BasePlugin):
         if need_assistant_reply:
             await self._request_person_reply(ctx, need_save_memory)
             asyncio.create_task(self._handle_narration(ctx, ctx.event.launcher_id))
+        self._schedule_event_timer(ctx, ctx.event.launcher_id)
 
     @handler(GroupMessageReceived)
     @handler(GroupNormalMessageReceived)
@@ -193,8 +200,15 @@ class Waifu(BasePlugin):
         need_assistant_reply, _ = await self._handle_command(ctx)
         if need_assistant_reply:
             await self._request_group_reply(ctx)
+        self._schedule_event_timer(ctx, ctx.event.launcher_id)
 
     async def _load_config(self, launcher_id: str, launcher_type: str):
+        # 重载配置会替换缓存对象，先停止旧对象上的主动事件计时器
+        if launcher_id in self.waifu_cache:
+            old_cache = self.waifu_cache[launcher_id]
+            if old_cache.event_timer_task:
+                old_cache.event_timer_task.cancel()
+
         self.waifu_cache[launcher_id] = WaifuCache(self.ap, launcher_id, launcher_type)
         cache = self.waifu_cache[launcher_id]
 
@@ -226,7 +240,11 @@ class Waifu(BasePlugin):
         cache.blacklist = config_mgr.data.get("blacklist", [])
         cache.langbot_group_rule = config_mgr.data.get("langbot_group_rule", False)
         cache.ignore_prefix = config_mgr.data.get("ignore_prefix", [])
-        cache.response_regexp = config_mgr.data.get("response_regexp", [])
+        cache.response_regexp = self._compile_response_regexp(
+            config_mgr.data.get("response_regexp", []), launcher_id
+        )
+        cache.events.load_config(config_mgr.data)
+        cache.searching.load_config(config_mgr.data)
 
         await cache.memory.load_config(character, launcher_id, launcher_type)
         await cache.value_game.load_config(character, launcher_id, launcher_type)
@@ -404,25 +422,73 @@ class Waifu(BasePlugin):
         config.unreplied_count += 1
         await self._group_reply(ctx)
 
-    async def _group_reply(self, ctx: EventContext):
+    def _get_message_text(self, ctx: EventContext) -> str:
+        """提取消息中的纯文本内容，忽略 At、图片等非文本元素。"""
+        message_chain = ctx.event.query.message_chain
+        if isinstance(message_chain, str):
+            return message_chain
+        try:
+            return "".join(
+                me.text if isinstance(me, platform_message.Plain) else me
+                for me in message_chain
+                if isinstance(me, (platform_message.Plain, str))
+            )
+        except TypeError:
+            return str(message_chain)
+
+    def _compile_response_regexp(self, patterns, launcher_id: str) -> typing.List[re.Pattern]:
+        """编译群消息响应正则，非法表达式会被跳过并记录日志。"""
+        if isinstance(patterns, str):
+            patterns = [patterns]
+        elif not isinstance(patterns, (list, tuple)):
+            self.ap.logger.error(f"群聊{launcher_id}的 response_regexp 配置格式错误，应为字符串列表。")
+            return []
+
+        compiled = []
+        for pattern in patterns:
+            if not isinstance(pattern, str) or not pattern.strip():
+                continue
+            try:
+                compiled.append(re.compile(pattern))
+            except re.error as e:
+                self.ap.logger.error(f"群聊{launcher_id}的 response_regexp 配置无效，已跳过：{pattern!r}（{e}）")
+        return compiled
+
+    def _match_response_regexp(self, ctx: EventContext, config: WaifuCache) -> bool:
+        """群消息纯文本命中任意一条正则时返回 True。"""
+        if not config.response_regexp:
+            return False
+        message_text = self._get_message_text(ctx)
+        if not message_text:
+            return False
+        for pattern in config.response_regexp:
+            if pattern.search(message_text):
+                self.ap.logger.info(f"群聊消息命中 response_regexp：{pattern.pattern!r}")
+                return True
+        return False
+
+    async def _group_reply(self, ctx: EventContext, check_regexp: bool = True):
         launcher_id = ctx.event.launcher_id
         config = self.waifu_cache[launcher_id]
         need_assistant_reply = False
         if config.group_message_chain and config.group_message_chain.has(platform_message.At(ctx.event.query.adapter.bot_account_id)):
             need_assistant_reply = True
-        if config.response_regexp:
-            message_text = str(ctx.event.query.message_chain)
-            need_assistant_reply = any(re.search(p, message_text) for p in config.response_regexp)
-        if config.unreplied_count >= config.memory.response_min_conversations:
+        # 命中自定义正则时必定回复，且不受回复概率与最小对话数限制
+        if check_regexp and self._match_response_regexp(ctx, config):
             need_assistant_reply = True
-        if random.random() < config.response_rate:
-            need_assistant_reply = True
-        else:
-            self.ap.logger.info(f"群聊{launcher_id}还差{config.memory.response_min_conversations - config.unreplied_count}条消息触发回复")
+
+        if not need_assistant_reply:
+            if config.unreplied_count >= config.memory.response_min_conversations:
+                if random.random() < config.response_rate:
+                    need_assistant_reply = True
+                else:
+                    self.ap.logger.info(f"群聊{launcher_id}未命中回复概率（response_rate={config.response_rate}）")
+            else:
+                self.ap.logger.info(f"群聊{launcher_id}还差{config.memory.response_min_conversations - config.unreplied_count}条消息触发回复")
 
         config.group_message_chain = None
         if need_assistant_reply:
-            if launcher_id not in self.waifu_cache or not config.response_timers_flag:
+            if not config.response_timers_flag:
                 config.response_timers_flag = True
                 asyncio.create_task(self._delayed_group_reply(ctx))
 
@@ -444,7 +510,8 @@ class Waifu(BasePlugin):
                 await self._send_group_reply(ctx)
 
             config.response_timers_flag = False
-            await self._group_reply(ctx)  # 检查是否回复期间又满足响应条件
+            # 检查是否回复期间又满足响应条件；同一条消息不再重复匹配正则，避免循环回复
+            await self._group_reply(ctx, check_regexp=False)
 
         except Exception as e:
             self.ap.logger.error(f"Error occurred during group reply: {e}")
@@ -459,6 +526,8 @@ class Waifu(BasePlugin):
         """
         launcher_id = ctx.event.launcher_id
         config = self.waifu_cache[launcher_id]
+        # 根据状态与行为触发事件，稍后注入当前回复上下文
+        event_text = await self._trigger_message_event(config)
         if config.summarization_mode:
             _, unreplied_conversations = config.memory.get_unreplied_msg(config.unreplied_count)
             related_memories = await config.memory.load_memory(unreplied_conversations)
@@ -466,6 +535,9 @@ class Waifu(BasePlugin):
                 config.cards.set_memory(related_memories)
         # 如果是群聊则不修改为自定义角色名
         system_prompt = config.memory.to_custom_names(config.cards.generate_system_prompt())
+        search_context = await config.searching.search_for_context(config.memory)
+        if search_context:
+            system_prompt = f"{system_prompt}\n\n{search_context}"
         # 备份然后重置避免回复过程中接收到新讯息导致计数错误
         unreplied_count = config.unreplied_count
         config.unreplied_count = 0
@@ -474,6 +546,13 @@ class Waifu(BasePlugin):
             user_prompt, analysis = await config.thoughts.generate_group_prompt(config.memory, config.cards, unreplied_count)
             if config.display_thinking and config.conversation_analysis_flag:
                 await self._reply(ctx, f"【分析】：{analysis}")
+        if event_text:
+            event_context = f"刚刚发生了以下事件：“{event_text}”。请在回复中自然地体现它，不要直接复述事件。"
+            if isinstance(user_prompt, list):
+                user_prompt.append(llm_entities.Message(role="user", content=event_context))
+            else:
+                user_prompt += event_context
+            await config.memory.save_memory(role="narrator", content=event_text)
         self._generator.set_speakers([config.memory.assistant_name])
         response = await self._generator.return_chat(user_prompt, system_prompt)
         await config.memory.save_memory(role="assistant", content=response)
@@ -521,6 +600,9 @@ class Waifu(BasePlugin):
                 related_memories = await config.memory.load_memory(unreplied_conversations)
                 config.cards.set_memory(related_memories)
 
+            # 根据状态与行为触发事件，并在生成回复前引入上下文
+            await self._inject_message_event(config)
+
             # user_prompt不直接从msg生成，而是先将msg保存至短期记忆，再由短期记忆生成。
             # 好处是不论旁白或是控制人物，都能直接调用记忆生成回复
             user_prompt = config.memory.get_normalize_short_term_memory()  # 默认为当前short_term_memory_size条聊天记录
@@ -548,10 +630,14 @@ class Waifu(BasePlugin):
         finally:
             config.response_timers_flag = False
 
-    async def _send_person_reply(self, ctx: EventContext, user_prompt: str | list[llm_entities.ContentElement]):
+    async def _send_person_reply(self, ctx: EventContext, user_prompt: str | list[llm_entities.ContentElement], allow_search: bool = True):
         launcher_id = ctx.event.launcher_id
         config = self.waifu_cache[launcher_id]
         system_prompt = config.memory.to_custom_names(config.cards.generate_system_prompt())
+        if allow_search:
+            search_context = await config.searching.search_for_context(config.memory)
+            if search_context:
+                system_prompt = f"{system_prompt}\n\n{search_context}"
         self._generator.set_speakers([config.memory.assistant_name])
         response = await self._generator.return_chat(user_prompt, system_prompt)
         await config.memory.save_memory(role="assistant", content=response)
@@ -573,7 +659,7 @@ class Waifu(BasePlugin):
         launcher_id = ctx.event.launcher_id
         config = self.waifu_cache[launcher_id]
         user_prompt = await config.thoughts.generate_person_continue_prompt(config.memory)
-        await self._send_person_reply(ctx, user_prompt)  # 生成回复并发送
+        await self._send_person_reply(ctx, user_prompt, allow_search=False)  # 生成回复并发送
 
     async def _handle_narration(self, ctx: EventContext, launcher_id: str):
         if launcher_id in self.waifu_cache and self.waifu_cache[launcher_id].launcher_timer_tasks:
@@ -608,6 +694,81 @@ class Waifu(BasePlugin):
             await self._reply(ctx, f"{config.memory.to_custom_names(narration)}")
             narration = config.memory.to_generic_names(narration)
             await config.memory.save_memory(role="narrator", content=narration)
+
+    async def _trigger_message_event(self, config: WaifuCache) -> str:
+        """检查消息触发规则，命中时返回事件描述。"""
+        try:
+            return await config.events.check_message_event(
+                config.memory,
+                config.cards,
+                config.value_game.get_value(),
+                config.value_game.get_manner_description(),
+            )
+        except Exception as e:
+            self.ap.logger.error(f"事件系统执行失败：{e}")
+            return ""
+
+    async def _inject_message_event(self, config: WaifuCache):
+        """私聊：把命中事件作为旁白写入记忆，供后续提示词使用。"""
+        event = await self._trigger_message_event(config)
+        if event:
+            content = config.memory.to_generic_names(event) if config.launcher_type == "person" else event
+            await config.memory.save_memory(role="narrator", content=content)
+
+    def _schedule_event_timer(self, ctx: EventContext, launcher_id: str):
+        """用户发言后重置空闲计时器，用于主动发起事件消息。"""
+        config = self.waifu_cache.get(launcher_id)
+        if not config:
+            return
+        if config.event_timer_task:
+            config.event_timer_task.cancel()
+            config.event_timer_task = None
+        if not config.events.enabled or config.events.idle_interval <= 0:
+            return
+        config.event_timer_task = asyncio.create_task(self._timed_event(ctx, launcher_id))
+
+    async def _timed_event(self, ctx: EventContext, launcher_id: str):
+        config = self.waifu_cache.get(launcher_id)
+        if not config:
+            return
+        try:
+            await asyncio.sleep(config.events.idle_interval)
+            if launcher_id not in self.waifu_cache:
+                return
+            config = self.waifu_cache[launcher_id]
+            # 正在生成回复或有未回复消息时，让位于正常对话
+            if config.response_timers_flag or config.unreplied_count > 0:
+                return
+            if not config.events.should_fire_idle(config.memory):
+                return
+            event, message = await config.events.generate_idle_event(
+                config.memory,
+                config.cards,
+                config.value_game.get_value(),
+                config.value_game.get_manner_description(),
+            )
+            if not message:
+                return
+            self.ap.logger.info(f"{launcher_id} 触发主动事件。")
+            await self._send_proactive_message(ctx, config, event, message)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.ap.logger.error(f"主动事件执行失败：{e}")
+        finally:
+            current = self.waifu_cache.get(launcher_id)
+            if current is not None and current.event_timer_task is asyncio.current_task():
+                current.event_timer_task = None
+
+    async def _send_proactive_message(self, ctx: EventContext, config: WaifuCache, event: str, message: str):
+        if event:
+            content = config.memory.to_generic_names(event) if config.launcher_type == "person" else event
+            await config.memory.save_memory(role="narrator", content=content)
+        await config.memory.save_memory(role="assistant", content=message)
+        if config.personate_mode and config.launcher_type == "person":
+            await self._send_personate_reply(ctx, message)
+        else:
+            await self._reply(ctx, message, True)
 
     async def _send_personate_reply(self, ctx: EventContext, response: str):
         config = self.waifu_cache[ctx.event.launcher_id]
@@ -726,6 +887,8 @@ class Waifu(BasePlugin):
         cache.value_game.set_jail_break(type, cache.memory.user_name)
         cache.narrator.set_jail_break(type, cache.memory.user_name)
         cache.thoughts.set_jail_break(type, cache.memory.user_name)
+        cache.events.set_jail_break(type, cache.memory.user_name)
+        cache.searching.set_jail_break(type, cache.memory.user_name)
 
     async def _test(self, ctx: EventContext):
         """
@@ -798,3 +961,5 @@ class Waifu(BasePlugin):
         for config in self.waifu_cache.values():
             if config.launcher_timer_tasks:
                 config.launcher_timer_tasks.cancel()
+            if config.event_timer_task:
+                config.event_timer_task.cancel()

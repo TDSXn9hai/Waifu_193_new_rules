@@ -329,6 +329,7 @@ class Memory:
             self._short_term_memory_file,
             self._status_file,
             f"data/plugins/Waifu/data/life_{self._launcher_id}.json",
+            f"data/plugins/Waifu/data/events_{self._launcher_id}.json",
         ]
 
         for file in files_to_delete:
@@ -449,7 +450,8 @@ class Memory:
         messages = []
         for message in reversed(self.short_term_memory):
             count += 1
-            if message.role != "assistant":
+            # narrator/system 不是群友发言，不参与未回复消息计数
+            if message.role not in ("assistant", "narrator", "system"):
                 messages.insert(0, message)
                 if len(messages) >= unreplied_count:
                     return count, messages
